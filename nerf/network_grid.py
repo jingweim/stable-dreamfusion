@@ -11,6 +11,20 @@ from encoding import get_encoder
 from .utils import safe_normalize
 
 class MLP(nn.Module):
+    '''
+        [Jingwei] to access model parameters (weights and biases)
+                    for param in model.parameters():
+                        ...
+
+        https://discuss.pytorch.org/t/how-are-layer-weights-and-biases-initialized-by-default/13073
+        layer weights initialized with:
+            stdv = 1. / math.sqrt(self.weight.size(1))
+            self.weight.data.uniform_(-stdv, stdv)
+            if self.bias is not None:
+                self.bias.data.uniform_(-stdv, stdv)
+
+        MLP: dim_in - dim_hidden - ... - dim_hidden - dim_out, relu every layer except for last
+    '''
     def __init__(self, dim_in, dim_out, dim_hidden, num_layers, bias=True):
         super().__init__()
         self.dim_in = dim_in
@@ -33,6 +47,23 @@ class MLP(nn.Module):
 
 
 class NeRFNetwork(NeRFRenderer):
+    '''
+        [Jingwei]
+        Model = grid encoder + 1-layer MLP
+            - grid encoder, encodes sampled xyzs (dim 3) into embedding (dim 32)
+            - 1-layer MLP, w0: 32x4, b0: 4
+                - sigma_net, computes density and albedo (channel 0 and channel 1-3)
+                    - density output combined with density_blob, passed into
+                    density_activation, a clipped torch.exp
+                    - albedo activation is just sigmoid
+                    - density blob ???
+            - 1-layer MLP, w0: 32x3, b0: 3
+                - normal_net, computes surface normals only for lambertian shading
+        background network = encoder + 2-layer MLP
+            - encoder ???
+            - 2-layer MLP, w0: 27x16, b0: 16, w1: 16x3, b1: 3
+        shading by default = albedo
+    '''
     def __init__(self, 
                  opt,
                  num_layers=1,
@@ -46,11 +77,13 @@ class NeRFNetwork(NeRFRenderer):
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
 
+        # [Jingwei] see gridencoder/grid.py 
         self.encoder, self.in_dim = get_encoder('hashgrid', input_dim=3, log2_hashmap_size=19, desired_resolution=2048 * self.bound, interpolation='smoothstep')
 
         self.sigma_net = MLP(self.in_dim, 4, hidden_dim, num_layers, bias=True)
         self.normal_net = MLP(self.in_dim, 3, hidden_dim, num_layers, bias=True)
 
+        # [Jingwei] self.opt.density_activation = 'softplus', smooth version of relu
         self.density_activation = trunc_exp if self.opt.density_activation == 'exp' else F.softplus
 
         # background network
@@ -67,6 +100,22 @@ class NeRFNetwork(NeRFRenderer):
 
     # add a density blob to the scene center
     def density_blob(self, x):
+        '''
+            [Jingwei] Intuitively, it forces density (out of MLP) to be bigger 
+                      for volume inside the density blob, and makes density much 
+                      smaller (negative) for volume outside (this only applies 
+                      to camera-inward scene)
+
+            x = xyz, N sampled points along B rays
+            d = squared distance from origin for each point
+                torch.sqrt(d).min().item(), torch.sqrt(d).max().item()
+                (0.011367525905370712, 1.7307978868484497)
+            self.opt.blob_density = 10, max density at the center
+            self.opt.blob_radius = 0.5
+            g = added to h[..., 0], density before activation
+                g.min().item(), g.max().item()
+                (-24.615957260131836, 9.772649765014648)
+        '''
         # x: [B, N, 3]
         
         d = (x ** 2).sum(-1)
@@ -76,6 +125,18 @@ class NeRFNetwork(NeRFRenderer):
         return g
 
     def common_forward(self, x):
+        '''
+            [Jingwei]
+            h = first channel decodes to sigma, last 3 channels decodes to rgb
+                h[..., 0].min().item(), h[..., 0].max().item()
+                (-0.005718231201171875, -0.0055084228515625)
+                h[..., 1:].min().item(), h[..., 1:].max().item()
+                (-0.034027099609375, 0.029144287109375)
+            sigma = truncated exp activation, clip max 15
+                sigma.min().item(), sigma.max().item()
+                (2.0276292797549722e-11, 9.767091751098633)
+            albedo (rgb) = sigmoid activation
+        '''
 
         # sigma
         enc = self.encoder(x, bound=self.bound)
@@ -105,6 +166,7 @@ class NeRFNetwork(NeRFRenderer):
             normal = safe_normalize(normal)
             normal = torch.nan_to_num(normal)
 
+            # [Jingwei] ratio = ambient_ratio in main.py
             lambertian = ratio + (1 - ratio) * (normal @ l).clamp(min=0) # [N,]
 
             if shading == 'textureless':
@@ -142,6 +204,7 @@ class NeRFNetwork(NeRFRenderer):
     # optimizer utils
     def get_params(self, lr):
 
+        # [Jingwei] 10x learning rate for hash-grid encoder
         params = [
             {'params': self.encoder.parameters(), 'lr': lr * 10},
             {'params': self.sigma_net.parameters(), 'lr': lr},
