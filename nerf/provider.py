@@ -199,6 +199,7 @@ class NeRFDataset:
 
     def collate(self, index):
 
+        # [Jingwei] Sampling rays from one pose at a time
         B = len(index) # always 1
 
         if self.training:
