@@ -1,5 +1,6 @@
 from transformers import CLIPTextModel, CLIPTokenizer, logging
 from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler, DDIMScheduler
+from diffusers.utils.import_utils import is_xformers_available
 
 # suppress partial model loading warning
 logging.set_verbosity_error()
@@ -8,9 +9,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import time
-
-
 from torch.cuda.amp import custom_bwd, custom_fwd 
 
 class SpecifyGradient(torch.autograd.Function):
@@ -18,9 +16,7 @@ class SpecifyGradient(torch.autograd.Function):
     @custom_fwd
     def forward(ctx, input_tensor, gt_grad):
         ctx.save_for_backward(gt_grad) 
-        
-        # dummy loss value
-        return torch.zeros([1], device=input_tensor.device, dtype=input_tensor.dtype)
+        return torch.zeros([1], device=input_tensor.device, dtype=input_tensor.dtype) # dummy loss value
 
     @staticmethod
     @custom_bwd
@@ -61,6 +57,9 @@ class StableDiffusion(nn.Module):
         self.tokenizer = CLIPTokenizer.from_pretrained(model_key, subfolder="tokenizer")
         self.text_encoder = CLIPTextModel.from_pretrained(model_key, subfolder="text_encoder").to(self.device)
         self.unet = UNet2DConditionModel.from_pretrained(model_key, subfolder="unet").to(self.device)
+
+        if is_xformers_available():
+            self.unet.enable_xformers_memory_efficient_attention()
         
         self.scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler")
         # self.scheduler = PNDMScheduler.from_pretrained(model_key, subfolder="scheduler")
@@ -96,20 +95,15 @@ class StableDiffusion(nn.Module):
         
         # interp to 512x512 to be fed into vae.
 
-        # _t = time.time()
         pred_rgb_512 = F.interpolate(pred_rgb, (512, 512), mode='bilinear', align_corners=False)
-        # torch.cuda.synchronize(); print(f'[TIME] guiding: interp {time.time() - _t:.4f}s')
 
         # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
         t = torch.randint(self.min_step, self.max_step + 1, [1], dtype=torch.long, device=self.device)
 
         # encode image into latents with vae, requires grad!
-        # _t = time.time()
         latents = self.encode_imgs(pred_rgb_512)
-        # torch.cuda.synchronize(); print(f'[TIME] guiding: vae enc {time.time() - _t:.4f}s')
 
         # predict the noise residual with unet, NO grad!
-        # _t = time.time()
         with torch.no_grad():
             # add noise
             noise = torch.randn_like(latents)
@@ -117,7 +111,6 @@ class StableDiffusion(nn.Module):
             # pred noise
             latent_model_input = torch.cat([latents_noisy] * 2)
             noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
-        # torch.cuda.synchronize(); print(f'[TIME] guiding: unet {time.time() - _t:.4f}s')
 
         # perform guidance (high scale from paper!)
         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -133,9 +126,7 @@ class StableDiffusion(nn.Module):
         grad = torch.nan_to_num(grad)
 
         # since we omitted an item in grad, we need to use the custom function to specify the gradient
-        # _t = time.time()
         loss = SpecifyGradient.apply(latents, grad) 
-        # torch.cuda.synchronize(); print(f'[TIME] guiding: backward {time.time() - _t:.4f}s')
 
         return loss 
 
@@ -217,7 +208,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('prompt', type=str)
     parser.add_argument('--negative', default='', type=str)
-    parser.add_argument('--sd_version', type=str, default='2.0', choices=['1.5', '2.0'], help="stable diffusion version")
+    parser.add_argument('--sd_version', type=str, default='2.1', choices=['1.5', '2.0', '2.1'], help="stable diffusion version")
+    parser.add_argument('--hf_key', type=str, default=None, help="hugging face Stable diffusion model key")
     parser.add_argument('-H', type=int, default=512)
     parser.add_argument('-W', type=int, default=512)
     parser.add_argument('--seed', type=int, default=0)
@@ -228,7 +220,7 @@ if __name__ == '__main__':
 
     device = torch.device('cuda')
 
-    sd = StableDiffusion(device, opt.sd_version)
+    sd = StableDiffusion(device, opt.sd_version, opt.hf_key)
 
     imgs = sd.prompt_to_img(opt.prompt, opt.negative, opt.H, opt.W, opt.steps)
 
