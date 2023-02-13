@@ -94,6 +94,33 @@ grid_encode = _grid_encode.apply
 
 
 class GridEncoder(nn.Module):
+    '''
+        [Jingwei]
+        base_resolution = 16
+        desire_resolution = 2048
+            scale = 2048/16 = 128
+            self.opt.bound gets multiplied to desire_resolution in a previous step, 
+            equivalent to aabb in instant-ngp
+        num_levels = 16 hashgrid of different resolutions
+        per_level_scale = 1.381912879967776, scaling factor each time, if 
+                          apply scaling factor num_levels-1 or 15 times
+        input_dim = 3, input is xyz coordinate
+        level_dim = 2, feature length is shorter than I thought
+        out_dim = 16*2 = 32, concatenating features from different levels
+        grid_type = 'hash', id is 0
+        interpolation = 'smoothstep', id is 1
+        align_corners = False, ???
+        self.max_params = 2**log2_hashmap_size = 2**19 = 524288, table size,
+                          each resolution can't have number of points more than
+                          table size
+        offsets = for indexing from different resolution grids, length 17
+                  [      0,    4920,   18744,   51512,  136696,  352696,  876984,
+                   1401272, 1925560, 2449848, 2974136, 3498424, 4022712, 4547000, 
+                   5071288, 5595576, 6119864]
+        self.n_params = 6119864 * 2 = 12239728
+        self.embeddings = (6119864, 2)
+        Finally, initialize the embeddings, std is always 1e-4
+    '''
     def __init__(self, input_dim=3, num_levels=16, level_dim=2, per_level_scale=2, base_resolution=16, log2_hashmap_size=19, desired_resolution=None, gridtype='hash', align_corners=False, interpolation='linear'):
         super().__init__()
 
@@ -143,6 +170,14 @@ class GridEncoder(nn.Module):
         return f"GridEncoder: input_dim={self.input_dim} num_levels={self.num_levels} level_dim={self.level_dim} resolution={self.base_resolution} -> {int(round(self.base_resolution * self.per_level_scale ** (self.num_levels - 1)))} per_level_scale={self.per_level_scale:.4f} params={tuple(self.embeddings.shape)} gridtype={self.gridtype} align_corners={self.align_corners} interpolation={self.interpolation}"
     
     def forward(self, inputs, bound=1):
+        '''
+            [Jingwei] [2097152, 3] -> [2097152, 32]
+            inputs: xyzs from outer call, pre-normalized to [-1, 1],
+                    torch.Size([2097152, 3]) 2097152 = 4096 rays * 512 (?)
+            outputs: 32 because 16 levels, level_dim is 2
+            1) map inputs from [-bound, bound] to [0, 1]
+            2) feed inputs into grid_encode, get outputs
+        '''
         # inputs: [..., input_dim], normalized real world positions in [-bound, bound]
         # return: [..., num_levels * level_dim]
 
